@@ -1,0 +1,125 @@
+
+🛠️ Act III: The Execution Diary (The Technical Codebase)
+
+Here is the step-by-step programming logic we used to move data out of raw storage, through dbt models, and straight into the Power BI semantic layer.
+
+🥉 Phase 1: Ingestion & Staging (The Bronze Layer SQL)
+
+To protect data integrity, the staging files do not modify the raw data. They simply clean up column naming conventions, enforce clean data types, and prepare the tables for modeling.
+sql
+-- file: models/staging/stg_physical_baselines.sql
+WITH raw_baselines AS (
+    SELECT 
+        UPPER(TRIM(store_id)) AS store_id,
+        UPPER(TRIM(sku_id))   AS product_id,
+        CAST(physical_baseline_qty AS INT) AS baseline_qty,
+        CAST(audit_verified_date AS DATE)  AS audit_date
+    FROM {{ source('phantom_raw', 'stg_physical_baselines') }}
+)
+SELECT * FROM raw_baselines;
+Use code with caution.
+
+🥈 Phase 2: Structural Enrichment (The Silver Layer SQL)
+
+This is where the heavy analytical lifting happens. We wrote a Unified Chronology Timeline Spine to ensure that even if a store had no sales or shipments on a specific day, the timeline remains unbroken. We then computed windowed running totals using SQL analytical functions.
+sql
+-- file: models/intermediate/int_silver_inventory_reconciliation.sql
+WITH calendar_spine AS (
+    -- Generates a seamless date backbone so there are zero calendar gaps
+    SELECT DISTINCT date_day FROM {{ ref('dim_calendar') }}
+),
+
+store_product_matrix AS (
+    -- Cross-joins stores and products to ensure absolute timeline coverage
+    SELECT s.store_key, p.product_key, c.date_day
+    FROM {{ ref('dim_stores') }} s
+    CROSS JOIN {{ ref('dim_products') }} p
+    CROSS JOIN calendar_spine c
+),
+
+running_inventory_metrics AS (
+    SELECT 
+        matrix.store_key,
+        matrix.product_key,
+        matrix.date_day,
+        COALESCE(b.baseline_qty, 0) AS initial_baseline,
+        
+        -- Calculates windowed running totals for inventory additions
+        SUM(COALESCE(rcv.received_qty, 0)) OVER (
+            PARTITION BY matrix.store_key, matrix.product_key 
+            ORDER BY matrix.date_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_received_qty,
+
+        -- Calculates windowed running totals for inventory subtractions
+        SUM(COALESCE(sales.sales_qty, 0)) OVER (
+            PARTITION BY matrix.store_key, matrix.product_key 
+            ORDER BY matrix.date_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_sales_qty
+        
+    FROM store_product_matrix matrix
+    LEFT JOIN {{ ref('stg_physical_baselines') }} b 
+        ON matrix.store_key = b.store_id AND matrix.product_key = b.product_key AND matrix.date_day = b.audit_date
+    LEFT JOIN {{ ref('stg_inbound_receiving') }} rcv 
+        ON matrix.store_key = rcv.store_id AND matrix.product_key = rcv.product_key AND matrix.date_day = rcv.received_date
+    LEFT JOIN {{ ref('stg_pos_sales') }} sales 
+        ON matrix.store_key = sales.store_id AND matrix.product_key = sales.product_key AND matrix.date_day = sales.sales_date
+)
+
+SELECT 
+    store_key,
+    product_key,
+    date_day,
+    -- Expected Inventory Formula: Baseline + what came in - what went out
+    (initial_baseline + running_received_qty - running_sales_qty) AS expected_inventory_qty
+FROM running_inventory_metrics;
+Use code with caution.
+
+🥇 Phase 3: Dimensional Optimization & Modeling (The Gold Layer SQL)
+
+To serve Power BI, we optimized the database structure into a high-performance Star Schema. This separates descriptors (Dimensions) from math (Facts) to completely eliminate visual lag.
+
+1. Designing the Dimensions (dim_products.sql)
+
+sql
+-- file: models/marts/dim_products.sql
+SELECT 
+    -- Generates a unique, clean hash key for fast database indexing
+    MD5(UPPER(TRIM(sku_id))) AS product_key,
+    sku_id                  AS product_sku,
+    COALESCE(product_name, 'Unknown Item') AS product_name,
+    COALESCE(category, 'General Inventory') AS product_category,
+    unit_price              AS product_retail_price
+FROM {{ ref('stg_products_raw') }};
+Use code with caution.
+
+2. Designing the Core Fact Table (fact_inventory_snapshot.sql)
+
+sql
+-- file: models/marts/fact_inventory_snapshot.sql
+SELECT 
+    MD5(store_id)   AS store_key,
+    MD5(product_id) AS product_key,
+    date_day        AS snapshot_date,
+    expected_inventory_qty,
+    
+    -- Anomaly Variance Metric tracking logic
+    CASE 
+        WHEN expected_inventory_qty < 0 THEN 'Negative Stock Warning'
+        WHEN expected_inventory_qty = 0 THEN 'Stockout Outage'
+        ELSE 'Healthy Allocation'
+    END AS operational_status
+FROM {{ ref('int_silver_inventory_reconciliation') }};
+Use code with caution.
+
+📊 Phase 4: Connecting the Semantic Layer (Power BI Integration)
+
+Once the Gold layer tables were generated inside Snowflake, we exposed them directly to the Power BI Semantic Layer.
+• The Star Schema Connection: Inside the Power BI modeling window, we dragged and dropped connections to form a perfect star layout—linking the product_key, store_key, and date_day fields from our dimension tables straight into the centered fact_inventory_snapshot table using 1-to-many (1:*) relationships.
+• DAX Business Measures: Instead of performing sluggish column calculations, we built fast, dynamic DAX measures directly inside the semantic layer to calculate inventory exceptions on the fly:
+dax
+-- DAX Measure inside Power BI for real-time Alert Tracking
+Inventory Anomaly Count = 
+CALCULATE(
+    COUNTROWS(fact_inventory_snapshot), 
+    fact_inventory_snapshot[operational_status] = "Negative Stock Warning"
+)
